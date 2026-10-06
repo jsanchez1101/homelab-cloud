@@ -1,0 +1,15 @@
+[Unit]
+Description=Report OSPF state to the live room watchdog
+After=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+# Run as the user that owns the NetOps agent and its devices.yaml.
+User=labagent
+Environment=LAB_WATCHDOG_URL=http://100.64.0.3:8787/report
+WorkingDirectory=/home/labagent/lab-agent
+ExecStart=/home/labagent/lab-agent/.venv/bin/python ospf_reporter.py devices.yaml
+TimeoutStartSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
