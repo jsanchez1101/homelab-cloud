@@ -11,6 +11,8 @@ RestartSec=15
 
 # Runs as a throwaway user with no write access to the system.
 DynamicUser=yes
+# Keeps the lab log across restarts in /var/lib/lab-watchdog (STATE_DIRECTORY).
+StateDirectory=lab-watchdog
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

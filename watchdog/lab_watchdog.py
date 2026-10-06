@@ -57,6 +57,11 @@ lock = threading.Lock()
 last_report = {"at": 0.0, "links": None, "routers": None, "since": None}
 NO_SINCE = {k: None for k in LINKS}
 
+# A short history of real changes, newest first, published with the status so the
+# site can show a lab log. It only changes when the lab does, so it adds no writes.
+EVENTS_MAX = 8
+EVENTS_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", ""), "events.json") if os.environ.get("STATE_DIRECTORY") else ""
+
 
 def log(msg):
     print(msg, flush=True)
@@ -214,12 +219,73 @@ def serve():
         time.sleep(10)
 
 
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def diff_events(old, new, at):
+    """Events for what changed between two published statuses (oldest first)."""
+    if old is None:
+        # First publish with no saved history: the "since" times say when each link came up.
+        seeded = [{"at": t, "type": "link_full", "subject": link}
+                  for link, t in new["since"].items() if t and new["links"][link] == "full"]
+        return sorted(seeded, key=lambda e: e["at"])
+    events = []
+    old_unknown = all(v == "unknown" for v in old["routers"].values())
+    new_unknown = all(v == "unknown" for v in new["routers"].values())
+    if new_unknown and not old_unknown:
+        events.append({"at": at, "type": "reports_lost", "subject": None})
+    elif old_unknown and not new_unknown:
+        events.append({"at": at, "type": "reports_back", "subject": None})
+    for name, state in new["hosts"].items():
+        if old["hosts"].get(name) != state:
+            events.append({"at": at, "type": f"host_{state}", "subject": name})
+    if not new_unknown:
+        for router, state in new["routers"].items():
+            if old["routers"].get(router) != state and state in ("up", "down"):
+                events.append({"at": at, "type": f"router_{state}", "subject": router})
+        for link, state in new["links"].items():
+            if old["links"].get(link) != state and state in ("full", "down"):
+                event_type = "link_full" if state == "full" else "link_down"
+                events.append({"at": new["since"].get(link) or at if state == "full" else at,
+                               "type": event_type, "subject": link})
+    return events
+
+
+def add_events(history, events):
+    """Newest first, capped."""
+    return sorted(history + events, key=lambda e: e["at"], reverse=True)[:EVENTS_MAX]
+
+
+def load_events():
+    if not EVENTS_FILE:
+        return None
+    try:
+        with open(EVENTS_FILE) as f:
+            events = json.load(f)
+        return events if isinstance(events, list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_events(events):
+    if not EVENTS_FILE:
+        return
+    tmp = EVENTS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(events, f)
+    os.replace(tmp, EVENTS_FILE)
+
+
 def main():
     if not BUCKET or not HOSTS or not REPORTER_IP:
         sys.exit("Set LAB_BUCKET, LAB_HOSTS and LAB_REPORTER (see lab-watchdog.env.example).")
     threading.Thread(target=serve, daemon=True).start()
     published, published_at = None, 0.0
     started = time.time()
+    saved = load_events()
+    history = saved or []
+    seed_needed = saved is None
     while True:
         # After a restart, give node1 time to report before publishing, so a
         # restart doesn't briefly tell the site the routers are unknown.
@@ -232,7 +298,14 @@ def main():
             status = steady_since(current_status(), published)
             due = time.time() - published_at >= HEARTBEAT
             if status != published or due:
-                stamped = {"checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), **status}
+                at = now_iso()
+                if published is not None or seed_needed:
+                    new_events = diff_events(published if published is not None else None, status, at)
+                    if new_events:
+                        history = add_events(history, new_events)
+                        save_events(history)
+                    seed_needed = False
+                stamped = {"checkedAt": at, **status, "events": history}
                 publish(stamped)
                 log(("change " if status != published else "heartbeat ") + json.dumps(status))
                 published, published_at = status, time.time()
