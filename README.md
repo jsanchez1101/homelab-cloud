@@ -43,25 +43,11 @@ jason-ss.dev /api/lab-status → the laptop on the homepage
 - **Sandboxed service.** The watchdog runs as a systemd `DynamicUser` with a read-only filesystem and a 64 MB memory cap. Its only privilege is `CAP_NET_RAW`, because Ubuntu 24.04 disables unprivileged ping.
 - **Untrusted input is validated twice.** The watchdog rejects reports with unknown keys, states or future timestamps; the website's API route re-validates the public file before the page sees it.
 
-## Setup
+## How it runs
 
-### 1. Cloud
+**Cloud.** `gcp-hybrid-setup.sh` built the project: a $5 budget alert, a custom VPC with IAP-only SSH, and an e2-micro running Ubuntu 24.04 that joined my tailnet. I then added the status bucket and the restricted service account by hand.
 
-```bash
-PROJECT_ID=my-homelab BILLING_ACCOUNT=XXXXXX-XXXXXX-XXXXXX ./gcp-hybrid-setup.sh
-```
-
-Then create a bucket, make `status.json` publicly readable, and give the VM a service account limited to that object (see Security above).
-
-### 2. Watchdog (cloud VM)
-
-```bash
-sudo install -D -m 0644 watchdog/lab_watchdog.py /opt/lab-watchdog/lab_watchdog.py
-sudo install -m 0644 watchdog/lab-watchdog.env.example /etc/lab-watchdog.env   # then edit it
-sudo install -m 0644 watchdog/lab-watchdog.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now lab-watchdog
-journalctl -u lab-watchdog -f -o cat
-```
+**Watchdog.** It runs on the VM as a systemd service (`watchdog/lab-watchdog.service`). Its settings live in `/etc/lab-watchdog.env` (example in `watchdog/lab-watchdog.env.example`):
 
 | Variable | Meaning |
 |---|---|
@@ -69,15 +55,11 @@ journalctl -u lab-watchdog -f -o cat
 | `LAB_HOSTS` | Home machines to ping, e.g. `node1=100.64.0.1,node2=100.64.0.2` |
 | `LAB_REPORTER` | Which of `LAB_HOSTS` may send OSPF reports |
 
-### 3. Collector (home)
+Each publish is logged, so `journalctl -u lab-watchdog -f` shows every change and heartbeat as it happens.
 
-It needs `netmiko` and `PyYAML`, and a `devices.yaml` with R1–R3's management addresses and a read-only login. Run it every minute from cron:
+**Collector.** It lives on node1 next to my NetOps agent, reusing that agent's Python environment and device file, and runs every minute from cron with `LAB_WATCHDOG_URL` pointing at the VM's Tailscale address. I used cron instead of the systemd timer in `collector/` because node1's sudo needs a password.
 
-```
-* * * * * cd $HOME/lab-agent && LAB_WATCHDOG_URL=http://<vm tailscale ip>:8787/report .venv/bin/python ospf_reporter.py devices.yaml >/dev/null 2>&1
-```
-
-`collector/ospf-reporter.service` and `.timer` are the systemd alternative.
+**Updating.** I edit here, run the tests, then copy the changed file to the VM or node1 and restart the service.
 
 ## Tests
 
