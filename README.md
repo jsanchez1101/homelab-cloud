@@ -81,3 +81,7 @@ Standard library only; netmiko and PyYAML are not needed to run them.
 - One collector and one watchdog: no redundancy. If the VM dies, the site shows "offline" after 12 minutes rather than failing over.
 - Router state comes from SSH reachability plus OSPF's own view. A router that is up but unreachable over management shows as down.
 - The topology (R1–R3 router IDs and links) is hard-coded in the collector.
+
+## License
+
+Original project code and documentation are available under the [MIT License](LICENSE). See [license scope and third-party materials](THIRD_PARTY_NOTICES.md) for exclusions and attribution boundaries.
