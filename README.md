@@ -1,15 +1,17 @@
 # homelab-cloud
 
-The pipeline behind the live lab display on [jason-ss.dev](https://jason-ss.dev). Three VyOS routers in my home EVE-NG lab report their OSPF state through a Google Cloud VM, and the homepage shows it: `3/3 ADJACENCIES · UP 2H 14M`, or `2/3` with the broken link in red when something goes down.
+The pipeline behind the live lab display on [jason-ss.dev](https://jason-ss.dev). Three VyOS routers in my home EVE-NG lab report their OSPF state, a watchdog publishes it to Cloud Storage, and the homepage shows it: `3/3 ADJACENCIES · UP 2H 14M`, or `2/3` with the broken link in red when something goes down.
+
+**Since 2026-10-30 the watchdog runs at home on node1, not on the Google Cloud VM.** The VM is stopped (disk kept) to save money; see [Moving the watchdog home](#moving-the-watchdog-home) for what that traded away. The same code runs in either place.
 
 ```
 R1–R3 (VyOS, EVE-NG)
    │  show ip ospf neighbor (read-only SSH)
    ▼
 node1 collector ─────── every 60 s
-   │  Tailscale only
+   │  localhost (was: Tailscale)
    ▼
-cloud-node1 watchdog ── GCP e2-micro; also pings the home machines itself
+watchdog ───────────── node1 since 2026-10-30 (was: GCP e2-micro); pings node1 and node2
    │  writes on change, plus a heartbeat every 5 min
    ▼
 gs://<bucket>/status.json  (public, max-age=30)
@@ -21,7 +23,7 @@ jason-ss.dev /api/lab-status → the laptop on the homepage
 | Path | Runs on | What it does |
 |---|---|---|
 | `gcp-hybrid-setup.sh` | laptop | Builds the GCP project, budget alert, VPC, firewall and VM |
-| `watchdog/` | cloud VM | Receives OSPF reports, pings the home machines, publishes `status.json` |
+| `watchdog/` | node1 (was: cloud VM) | Receives OSPF reports, pings the home machines, publishes `status.json` |
 | `collector/` | node1 (home) | Reads OSPF neighbors from the routers and reports to the watchdog |
 | `tests/` | anywhere | Unit tests for validation, uptime parsing and change detection |
 
@@ -36,6 +38,8 @@ jason-ss.dev /api/lab-status → the laptop on the homepage
 **About 2 cents a month.** Writing the file every minute would mean ~43k Cloud Storage writes a month. The watchdog writes only when the status changes, plus a heartbeat every 5 minutes (~9k writes). Uptime is published as "up since" timestamps rather than a running counter, so the file doesn't change every minute; the browser counts up. Collection jitter of a second or two is smoothed out so it doesn't count as a change.
 
 ## Security
+
+This describes the cloud VM setup that ran until 2026-10-30. For what changed when the watchdog moved home, see [Moving the watchdog home](#moving-the-watchdog-home).
 
 - **Least privilege, verified.** The VM runs as a dedicated service account that can write one object, `status.json`, in one bucket, enforced with an IAM condition on the object name. Writing any other object returns 403.
 - **No public SSH.** The VPC only allows SSH from Google's IAP range. Day-to-day access is over Tailscale. The default network and its open rules were deleted.
@@ -60,6 +64,17 @@ Each publish is logged, so `journalctl -u lab-watchdog -f` shows every change an
 **Collector.** It lives on node1 next to my NetOps agent, reusing that agent's Python environment and device file, and runs every minute from cron with `LAB_WATCHDOG_URL` pointing at the VM's Tailscale address. I used cron instead of the systemd timer in `collector/` because node1's sudo needs a password.
 
 **Updating.** I edit here, run the tests, then copy the changed file to the VM or node1 and restart the service.
+
+## Moving the watchdog home
+
+In October 2026 I moved the watchdog from the cloud VM to node1 to stop paying for an always-on VM and its public IP. The code didn't change shape: three optional settings (`LAB_LISTEN`, `LAB_REPORTER_IP`, `LAB_KEY_FILE`) let it listen on localhost and sign in with a service-account key instead of the VM's built-in identity. The VM is stopped with its disk kept, so moving back is one command.
+
+What I gave up, on purpose:
+
+- **An outside observer.** The site still notices when the house goes quiet: it treats a status file older than two missed heartbeats as offline. But it can no longer tell "home internet down" from "node1 down"; both read as offline.
+- **No secrets anywhere.** On the VM, the watchdog borrowed the VM's identity and there was no key to leak. At home it needs a key file. The key belongs to the same restricted account, so the IAM condition still limits it to writing `status.json` in one bucket; worst case, someone with node1 access could fake the lab status. The file is readable only by its owner.
+
+At home it runs as a user service (`watchdog/lab-watchdog-home.service`) with a 128 MB memory cap, listening on `127.0.0.1:8788`; the collector's cron entry points there.
 
 ## Tests
 

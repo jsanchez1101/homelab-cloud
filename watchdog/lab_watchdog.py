@@ -13,6 +13,12 @@ Configuration comes from the environment (see lab-watchdog.env.example):
     LAB_BUCKET     Cloud Storage bucket that holds the public status file
     LAB_HOSTS      home machines to ping, as name=tailscale-ip pairs
     LAB_REPORTER   which of LAB_HOSTS may send OSPF reports
+
+Optional, for running it at home instead of on a cloud VM:
+    LAB_LISTEN       address:port to listen on (default: the tailscale0 address, port 8787)
+    LAB_REPORTER_IP  address reports must come from (default: LAB_REPORTER's address in LAB_HOSTS)
+    LAB_KEY_FILE     service-account key allowed to write only to LAB_BUCKET (default: the VM's
+                     metadata-server identity). Needs the `cryptography` package to sign.
 """
 import json
 import os
@@ -20,6 +26,7 @@ import sys
 import subprocess
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,7 +58,9 @@ def parse_hosts(value):
 
 BUCKET = os.environ.get("LAB_BUCKET", "")
 HOSTS = parse_hosts(os.environ.get("LAB_HOSTS", ""))
-REPORTER_IP = HOSTS.get(os.environ.get("LAB_REPORTER", ""), "")
+REPORTER_IP = os.environ.get("LAB_REPORTER_IP") or HOSTS.get(os.environ.get("LAB_REPORTER", ""), "")
+LISTEN = os.environ.get("LAB_LISTEN", "")
+KEY_FILE = os.environ.get("LAB_KEY_FILE", "")
 
 lock = threading.Lock()
 last_report = {"at": 0.0, "links": None, "routers": None, "since": None}
@@ -179,7 +188,36 @@ def steady_since(status, published):
     return {**status, "since": since}
 
 
+_token = {"value": None, "expires": 0.0}
+
+
+def key_file_token(path, now=None):
+    """OAuth token for a service-account key (JWT bearer grant), cached until near expiry."""
+    import base64
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    now = int(now or time.time())
+    if _token["value"] and _token["expires"] - 120 > now:
+        return _token["value"]
+    with open(path) as f:
+        key = json.load(f)
+    b64 = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=")
+    header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    claims = b64(json.dumps({"iss": key["client_email"], "aud": key["token_uri"], "iat": now, "exp": now + 3600,
+                             "scope": "https://www.googleapis.com/auth/devstorage.read_write"}).encode())
+    private = serialization.load_pem_private_key(key["private_key"].encode(), password=None)
+    signature = b64(private.sign(header + b"." + claims, padding.PKCS1v15(), hashes.SHA256()))
+    body = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                                   "assertion": (header + b"." + claims + b"." + signature).decode()}).encode()
+    with urllib.request.urlopen(urllib.request.Request(key["token_uri"], data=body), timeout=10) as resp:
+        data = json.load(resp)
+    _token.update(value=data["access_token"], expires=now + int(data.get("expires_in", 3600)))
+    return _token["value"]
+
+
 def access_token():
+    if KEY_FILE:
+        return key_file_token(KEY_FILE)
     req = urllib.request.Request(
         "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
         headers={"Metadata-Flavor": "Google"})
@@ -205,14 +243,21 @@ def publish(status):
         resp.read()
 
 
+def listen_address():
+    if LISTEN:
+        host, _, port = LISTEN.rpartition(":")
+        return host, int(port)
+    return tailscale_ip(), LISTEN_PORT
+
+
 def serve():
     # tailscale0 may not have its address yet right after boot; keep trying.
     while True:
-        ip = tailscale_ip()
+        ip, port = listen_address()
         if ip:
             try:
-                server = ThreadingHTTPServer((ip, LISTEN_PORT), ReportHandler)
-                log(f"listening on {ip}:{LISTEN_PORT}")
+                server = ThreadingHTTPServer((ip, port), ReportHandler)
+                log(f"listening on {ip}:{port}")
                 server.serve_forever()
             except OSError as err:
                 log(f"bind failed: {err}")

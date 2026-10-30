@@ -1,0 +1,17 @@
+# User service for running the watchdog at home (node1), not on the cloud VM.
+# Install: copy to ~/.config/systemd/user/lab-watchdog.service, then
+#   systemctl --user daemon-reload && systemctl --user enable --now lab-watchdog
+[Unit]
+Description=Live room watchdog at home (publishes jason-ss.dev lab status)
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/lab-status/watchdog.env
+Environment=STATE_DIRECTORY=%h/lab-watchdog/state
+ExecStart=%h/eve-gesture-backend/venv/bin/python %h/lab-watchdog/lab_watchdog.py
+Restart=always
+RestartSec=15
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target

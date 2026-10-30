@@ -94,3 +94,44 @@ class EventsTest(unittest.TestCase):
         history = w.add_events([], events)
         self.assertEqual(len(history), w.EVENTS_MAX)
         self.assertEqual(history[0]["at"], "2026-10-06T09:00:00Z")
+
+
+class HomeModeTests(unittest.TestCase):
+    def test_listen_setting_overrides_tailscale_address(self):
+        old = w.LISTEN
+        try:
+            w.LISTEN = "127.0.0.1:8788"
+            self.assertEqual(w.listen_address(), ("127.0.0.1", 8788))
+        finally:
+            w.LISTEN = old
+
+    def test_key_file_token_signs_a_jwt_and_caches_it(self):
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+        except ImportError:
+            self.skipTest("cryptography not installed")
+        import json, tempfile, io, base64
+        from unittest import mock
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                serialization.NoEncryption()).decode()
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"client_email": "sa@example.iam.gserviceaccount.com", "private_key": pem,
+                       "token_uri": "https://oauth2.example/token"}, f)
+        sent = []
+
+        def fake_urlopen(req, timeout=0):
+            sent.append(req)
+            return io.BytesIO(json.dumps({"access_token": "tok", "expires_in": 3600}).encode())
+
+        w._token.update(value=None, expires=0.0)
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            self.assertEqual(w.key_file_token(f.name, now=1000), "tok")
+            self.assertEqual(w.key_file_token(f.name, now=1100), "tok")   # cached, no second request
+        self.assertEqual(len(sent), 1)
+        assertion = dict(x.split("=", 1) for x in sent[0].data.decode().split("&"))["assertion"]
+        claims = json.loads(base64.urlsafe_b64decode(assertion.split(".")[1] + "=="))
+        self.assertEqual(claims["iss"], "sa@example.iam.gserviceaccount.com")
+        self.assertEqual(claims["scope"], "https://www.googleapis.com/auth/devstorage.read_write")
+        os.unlink(f.name)
