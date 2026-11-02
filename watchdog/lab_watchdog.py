@@ -19,7 +19,11 @@ Optional, for running it at home instead of on a cloud VM:
     LAB_REPORTER_IP  address reports must come from (default: LAB_REPORTER's address in LAB_HOSTS)
     LAB_KEY_FILE     service-account key allowed to write only to LAB_BUCKET (default: the VM's
                      metadata-server identity). Needs the `cryptography` package to sign.
+    LAB_PAUSE_FILE   JSON file whose "holders" map ({id: start epoch seconds}) marks the lab as paused
+                     on purpose, e.g. agent mode's hold record. While a hold is active the status
+                     carries "paused": {"since", "reason"} so the site can say paused, not offline.
 """
+import math
 import json
 import os
 import sys
@@ -61,6 +65,8 @@ HOSTS = parse_hosts(os.environ.get("LAB_HOSTS", ""))
 REPORTER_IP = os.environ.get("LAB_REPORTER_IP") or HOSTS.get(os.environ.get("LAB_REPORTER", ""), "")
 LISTEN = os.environ.get("LAB_LISTEN", "")
 KEY_FILE = os.environ.get("LAB_KEY_FILE", "")
+PAUSE_FILE = os.environ.get("LAB_PAUSE_FILE", "")
+PAUSE_REASON = "Paused for local AI model work"
 
 lock = threading.Lock()
 last_report = {"at": 0.0, "links": None, "routers": None, "since": None}
@@ -156,6 +162,27 @@ def tailscale_ip():
     return fields[3].split("/")[0] if len(fields) > 3 else ""
 
 
+def current_pause(now=None):
+    """{"since", "reason"} while an intentional hold is active, else None. Never names a machine."""
+    if not PAUSE_FILE:
+        return None
+    try:
+        with open(PAUSE_FILE) as f:
+            holders = json.load(f).get("holders") or {}
+    except (OSError, ValueError, AttributeError):
+        return None
+    now = time.time() if now is None else now
+    if not isinstance(holders, dict):
+        return None
+    # Explicit holds persist until released, including multi-day AI sessions.
+    starts = [t for t in holders.values() if type(t) in (int, float)
+              and math.isfinite(t) and 0 < t <= now]
+    if not starts:
+        return None
+    since = datetime.fromtimestamp(min(starts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"since": since, "reason": PAUSE_REASON}
+
+
 def current_status():
     hosts = {name: ("up" if host_up(ip) else "down") for name, ip in HOSTS.items()}
     with lock:
@@ -168,7 +195,7 @@ def current_status():
         links = {k: "unknown" for k in LINKS}
         routers = {k: "unknown" for k in ROUTERS}
         since = dict(NO_SINCE)
-    return {"links": links, "routers": routers, "since": since, "hosts": hosts}
+    return {"links": links, "routers": routers, "since": since, "hosts": hosts, "paused": current_pause()}
 
 
 def steady_since(status, published):
@@ -276,6 +303,10 @@ def diff_events(old, new, at):
                   for link, t in new["since"].items() if t and new["links"][link] == "full"]
         return sorted(seeded, key=lambda e: e["at"])
     events = []
+    if new.get("paused") and not old.get("paused"):
+        events.append({"at": new["paused"]["since"], "type": "lab_paused", "subject": None})
+    elif old.get("paused") and not new.get("paused"):
+        events.append({"at": at, "type": "lab_resumed", "subject": None})
     old_unknown = all(v == "unknown" for v in old["routers"].values())
     new_unknown = all(v == "unknown" for v in new["routers"].values())
     if new_unknown and not old_unknown:

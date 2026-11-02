@@ -96,6 +96,52 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(history[0]["at"], "2026-10-06T09:00:00Z")
 
 
+class PauseTest(unittest.TestCase):
+    def pause_from(self, content, now):
+        import json, tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(content if isinstance(content, str) else json.dumps(content))
+        old = w.PAUSE_FILE
+        w.PAUSE_FILE = f.name
+        try:
+            return w.current_pause(now=now)
+        finally:
+            w.PAUSE_FILE = old
+            os.unlink(f.name)
+
+    def test_active_hold_reports_earliest_start_and_generic_reason(self):
+        p = self.pause_from({"holders": {"chat35": 1_800_000_000, "bench": 1_800_000_600}}, now=1_800_003_600)
+        self.assertEqual(p, {"since": "2027-01-15T08:00:00Z", "reason": w.PAUSE_REASON})
+
+    def test_long_holds_remain_paused_and_invalid_holds_are_ignored(self):
+        self.assertIsNotNone(self.pause_from({"holders": {"old": 1_800_000_000}}, now=1_800_000_000 + 7 * 86400))
+        for holders in ([1], {"bad": True}, {"bad": float("inf")}, {"bad": -1}, {"future": 1_900_000_000}):
+            self.assertIsNone(self.pause_from({"holders": holders}, now=1_800_000_000))
+        self.assertIsNone(self.pause_from({"holders": {}}, now=1_800_000_000))
+        self.assertIsNone(self.pause_from("not json", now=1_800_000_000))
+        self.assertIsNone(self.pause_from(["a", "list"], now=1_800_000_000))
+
+    def test_no_pause_file_configured(self):
+        old = w.PAUSE_FILE
+        w.PAUSE_FILE = ""
+        try:
+            self.assertIsNone(w.current_pause())
+        finally:
+            w.PAUSE_FILE = old
+
+    def test_paused_and_resumed_events(self):
+        base = EventsTest.status(EventsTest())
+        paused = {**base, "paused": {"since": "2026-11-02T02:50:00Z", "reason": w.PAUSE_REASON}}
+        self.assertIn({"at": "2026-11-02T02:50:00Z", "type": "lab_paused", "subject": None},
+                      w.diff_events({**base, "paused": None}, paused, "2026-11-02T02:51:00Z"))
+        self.assertIn({"at": "2026-11-02T09:00:00Z", "type": "lab_resumed", "subject": None},
+                      w.diff_events(paused, {**base, "paused": None}, "2026-11-02T09:00:00Z"))
+
+    def test_statuses_published_before_this_change_still_compare(self):
+        base = EventsTest.status(EventsTest())          # no "paused" key at all
+        self.assertEqual(w.diff_events(base, {**base, "paused": None}, "2026-11-02T00:00:00Z"), [])
+
+
 class HomeModeTests(unittest.TestCase):
     def test_listen_setting_overrides_tailscale_address(self):
         old = w.LISTEN
